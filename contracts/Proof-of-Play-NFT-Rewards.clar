@@ -15,6 +15,7 @@
 (define-data-var next-token-id uint u1)
 (define-data-var next-game-id uint u1)
 (define-data-var next-achievement-id uint u1)
+(define-data-var global-leaderboard (list 100 {player: principal, total-playtime: uint, achievement-count: uint}) (list))
 
 (define-map oracles principal bool)
 (define-map games uint {name: (string-ascii 50), required-playtime: uint, active: bool})
@@ -80,6 +81,35 @@
             (>= actual-playtime required-playtime)
         )
     )
+)
+
+(define-read-only (get-leaderboard)
+    (var-get global-leaderboard)
+)
+
+(define-read-only (get-player-rank (player principal))
+    (let (
+        (leaderboard (var-get global-leaderboard))
+        (player-stats (get-player-progress player))
+    )
+        (index-of leaderboard {player: player, total-playtime: (get total-playtime player-stats), achievement-count: (len (get achievements-earned player-stats))})
+    )
+)
+
+(define-private (update-leaderboard-entry (player principal) (playtime uint) (achievement-count uint))
+    (let (
+        (current-board (var-get global-leaderboard))
+        (new-entry {player: player, total-playtime: playtime, achievement-count: achievement-count})
+        (filtered-board (filter is-not-current-player current-board))
+        (updated-board (unwrap-panic (as-max-len? (append filtered-board new-entry) u100)))
+    )
+        (var-set global-leaderboard updated-board)
+        true
+    )
+)
+
+(define-private (is-not-current-player (entry {player: principal, total-playtime: uint, achievement-count: uint}))
+    (not (is-eq (get player entry) tx-sender))
 )
 
 (define-public (add-oracle (oracle-address principal))
@@ -156,17 +186,20 @@
         (current-total-playtime (get total-playtime player-data))
         (current-games (get games-played player-data))
         (current-achievements (get achievements-earned player-data))
+        (new-total-playtime (+ current-total-playtime playtime-minutes))
+        (achievement-count (len (get achievements-earned player-data)))
     )
         (asserts! (is-oracle tx-sender) err-not-oracle)
         (asserts! (is-some (get-game game-id)) err-invalid-game)
         (map-set game-playtime {player: player, game-id: game-id} {total-time: new-total, last-updated: current-block})
         (map-set player-progress player {
-            total-playtime: (+ current-total-playtime playtime-minutes),
+            total-playtime: new-total-playtime,
             games-played: (if (is-none (index-of current-games game-id))
                           (unwrap! (as-max-len? (append current-games game-id) u20) (ok true))
                           current-games),
             achievements-earned: current-achievements
         })
+        (update-leaderboard-entry player new-total-playtime achievement-count)
         (ok true)
     )
 )
@@ -179,6 +212,9 @@
         (current-block u0)
         (player-data (get-player-progress tx-sender))
         (current-achievements (get achievements-earned player-data))
+        (new-achievements (unwrap! (as-max-len? (append current-achievements achievement-id) u50) err-invalid-achievement))
+        (new-achievement-count (len new-achievements))
+        (total-playtime (get total-playtime player-data))
     )
         (asserts! (can-claim-achievement tx-sender achievement-id) err-insufficient-playtime)
         (try! (nft-mint? proof-of-play-nft token-id tx-sender))
@@ -190,8 +226,9 @@
             game-id: game-id
         })
         (map-set player-progress tx-sender (merge player-data {
-            achievements-earned: (unwrap! (as-max-len? (append current-achievements achievement-id) u50) err-invalid-achievement)
+            achievements-earned: new-achievements
         }))
+        (update-leaderboard-entry tx-sender total-playtime new-achievement-count)
         (var-set next-token-id (+ token-id u1))
         (ok token-id)
     )
