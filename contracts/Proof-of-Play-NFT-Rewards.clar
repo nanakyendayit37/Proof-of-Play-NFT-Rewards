@@ -11,6 +11,9 @@
 (define-constant err-invalid-game (err u107))
 (define-constant err-oracle-exists (err u108))
 (define-constant err-game-exists (err u109))
+(define-constant err-streak-broken (err u110))
+(define-constant err-milestone-claimed (err u111))
+(define-constant err-invalid-milestone (err u112))
 
 (define-data-var next-token-id uint u1)
 (define-data-var next-game-id uint u1)
@@ -25,6 +28,10 @@
 (define-map nft-metadata uint {achievement-id: uint, player: principal, timestamp: uint, game-id: uint})
 (define-map leaderboard-entries principal {score: uint, rank: uint, last-updated: uint})
 (define-data-var leaderboard-players (list 100 principal) (list))
+(define-map player-streaks principal {current-streak: uint, longest-streak: uint, last-play-day: uint, total-streak-days: uint})
+(define-map streak-milestones uint {days-required: uint, bonus-multiplier: uint, active: bool})
+(define-map milestone-claims {player: principal, milestone-id: uint} bool)
+(define-data-var next-milestone-id uint u1)
 
 (define-read-only (get-last-token-id)
     (- (var-get next-token-id) u1)
@@ -78,6 +85,35 @@
     (match (get-leaderboard-entry player)
         entry (ok (get rank entry))
         (ok u0)
+    )
+)
+
+(define-read-only (get-player-streak (player principal))
+    (default-to {current-streak: u0, longest-streak: u0, last-play-day: u0, total-streak-days: u0} (map-get? player-streaks player))
+)
+
+(define-read-only (get-streak-milestone (milestone-id uint))
+    (map-get? streak-milestones milestone-id)
+)
+
+(define-read-only (has-claimed-milestone (player principal) (milestone-id uint))
+    (default-to false (map-get? milestone-claims {player: player, milestone-id: milestone-id}))
+)
+
+(define-read-only (can-claim-milestone (player principal) (milestone-id uint))
+    (let (
+        (milestone-data (unwrap! (get-streak-milestone milestone-id) false))
+        (days-required (get days-required milestone-data))
+        (player-streak-data (get-player-streak player))
+        (current-streak (get current-streak player-streak-data))
+        (already-claimed (has-claimed-milestone player milestone-id))
+        (milestone-active (get active milestone-data))
+    )
+        (and 
+            milestone-active
+            (not already-claimed)
+            (>= current-streak days-required)
+        )
     )
 )
 
@@ -163,6 +199,31 @@
     )
 )
 
+(define-public (add-streak-milestone (days-required uint) (bonus-multiplier uint))
+    (let (
+        (milestone-id (var-get next-milestone-id))
+    )
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (map-set streak-milestones milestone-id {
+            days-required: days-required,
+            bonus-multiplier: bonus-multiplier,
+            active: true
+        })
+        (var-set next-milestone-id (+ milestone-id u1))
+        (ok milestone-id)
+    )
+)
+
+(define-public (toggle-milestone-status (milestone-id uint))
+    (let (
+        (milestone-data (unwrap! (get-streak-milestone milestone-id) err-invalid-milestone))
+        (current-status (get active milestone-data))
+    )
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (ok (map-set streak-milestones milestone-id (merge milestone-data {active: (not current-status)})))
+    )
+)
+
 (define-public (update-playtime (player principal) (game-id uint) (playtime-minutes uint))
     (let (
         (current-data (get-player-game-playtime player game-id))
@@ -184,8 +245,32 @@
                           current-games),
             achievements-earned: current-achievements
         })
+        (update-player-streak player current-block)
         (update-leaderboard player)
         (ok true)
+    )
+)
+
+(define-public (claim-streak-milestone (milestone-id uint))
+    (let (
+        (milestone-data (unwrap! (get-streak-milestone milestone-id) err-invalid-milestone))
+        (bonus-multiplier (get bonus-multiplier milestone-data))
+        (token-id (var-get next-token-id))
+        (current-block u0)
+        (player-streak-data (get-player-streak tx-sender))
+    )
+        (asserts! (can-claim-milestone tx-sender milestone-id) err-streak-broken)
+        (try! (nft-mint? proof-of-play-nft token-id tx-sender))
+        (map-set milestone-claims {player: tx-sender, milestone-id: milestone-id} true)
+        (map-set nft-metadata token-id {
+            achievement-id: u0,
+            player: tx-sender,
+            timestamp: current-block,
+            game-id: u0
+        })
+        (update-leaderboard tx-sender)
+        (var-set next-token-id (+ token-id u1))
+        (ok token-id)
     )
 )
 
@@ -258,6 +343,32 @@
             )
             true
         )
+    )
+)
+
+(define-private (update-player-streak (player principal) (current-day uint))
+    (let (
+        (streak-data (get-player-streak player))
+        (current-streak (get current-streak streak-data))
+        (longest-streak (get longest-streak streak-data))
+        (last-play-day (get last-play-day streak-data))
+        (total-streak-days (get total-streak-days streak-data))
+        (day-diff (if (> current-day last-play-day) (- current-day last-play-day) u0))
+        (new-streak (if (is-eq day-diff u1)
+                        (+ current-streak u1)
+                        (if (is-eq day-diff u0)
+                            current-streak
+                            u1)))
+        (new-longest (if (> new-streak longest-streak) new-streak longest-streak))
+        (new-total (if (is-eq day-diff u0) total-streak-days (+ total-streak-days u1)))
+    )
+        (map-set player-streaks player {
+            current-streak: new-streak,
+            longest-streak: new-longest,
+            last-play-day: current-day,
+            total-streak-days: new-total
+        })
+        true
     )
 )
 
