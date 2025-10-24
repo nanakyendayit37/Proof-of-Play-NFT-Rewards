@@ -23,6 +23,8 @@
 (define-map game-playtime {player: principal, game-id: uint} {total-time: uint, last-updated: uint})
 (define-map achievement-claims {player: principal, achievement-id: uint} bool)
 (define-map nft-metadata uint {achievement-id: uint, player: principal, timestamp: uint, game-id: uint})
+(define-map leaderboard-entries principal {score: uint, rank: uint, last-updated: uint})
+(define-data-var leaderboard-players (list 100 principal) (list))
 
 (define-read-only (get-last-token-id)
     (- (var-get next-token-id) u1)
@@ -62,6 +64,21 @@
 
 (define-read-only (get-nft-metadata (token-id uint))
     (map-get? nft-metadata token-id)
+)
+
+(define-read-only (get-leaderboard-entry (player principal))
+    (map-get? leaderboard-entries player)
+)
+
+(define-read-only (get-leaderboard)
+    (ok (var-get leaderboard-players))
+)
+
+(define-read-only (get-player-rank (player principal))
+    (match (get-leaderboard-entry player)
+        entry (ok (get rank entry))
+        (ok u0)
+    )
 )
 
 (define-read-only (can-claim-achievement (player principal) (achievement-id uint))
@@ -167,6 +184,7 @@
                           current-games),
             achievements-earned: current-achievements
         })
+        (update-leaderboard player)
         (ok true)
     )
 )
@@ -192,6 +210,7 @@
         (map-set player-progress tx-sender (merge player-data {
             achievements-earned: (unwrap! (as-max-len? (append current-achievements achievement-id) u50) err-invalid-achievement)
         }))
+        (update-leaderboard tx-sender)
         (var-set next-token-id (+ token-id u1))
         (ok token-id)
     )
@@ -210,6 +229,35 @@
     )
         (asserts! (is-eq tx-sender owner) err-not-token-owner)
         (nft-burn? proof-of-play-nft token-id owner)
+    )
+)
+
+(define-private (calculate-player-score (player principal))
+    (let (
+        (player-data (get-player-progress player))
+        (total-playtime (get total-playtime player-data))
+        (achievement-count (len (get achievements-earned player-data)))
+    )
+        (+ total-playtime (* achievement-count u1000))
+    )
+)
+
+(define-private (update-leaderboard (player principal))
+    (let (
+        (player-score (calculate-player-score player))
+        (current-leaderboard (var-get leaderboard-players))
+        (current-block u0)
+    )
+        (begin
+            (map-set leaderboard-entries player {score: player-score, rank: u0, last-updated: current-block})
+            (var-set leaderboard-players 
+                (if (is-none (index-of current-leaderboard player))
+                    (unwrap-panic (as-max-len? (append current-leaderboard player) u100))
+                    current-leaderboard
+                )
+            )
+            true
+        )
     )
 )
 
